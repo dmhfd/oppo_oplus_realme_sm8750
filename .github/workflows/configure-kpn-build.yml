@@ -25,8 +25,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          URL='https://raw.githubusercontent.com/dmhfd/android_kernel_common_oneplus_sm8750/oneplus/sm8750_v_15.0.0_oneplus_13/kernel/locking/rtmutex.c'
-          API='https://raw.githubusercontent.com/dmhfd/android_kernel_common_oneplus_sm8750/oneplus/sm8750_v_15.0.0_oneplus_13/kernel/locking/rtmutex_api.c'
+          URL='https://raw.githubusercontent.com/dmhfd/android_kernel_common_oneplus_sm8750/refs/heads/oneplus/sm8750_v_15.0.0_oneplus_13/kernel/locking/rtmutex.c'
+          API='https://raw.githubusercontent.com/dmhfd/android_kernel_common_oneplus_sm8750/refs/heads/oneplus/sm8750_v_15.0.0_oneplus_13/kernel/locking/rtmutex_api.c'
           for i in $(seq 1 60); do
             if curl -fsSL "$URL" | grep -q 'struct task_struct \*waiter_task = waiter->task;' && \
                curl -fsSL "$API" | grep -q 'if (unlikely(ret < 0))'; then
