@@ -1,0 +1,108 @@
+name: Configure and launch 6.6.30 KPatch-Next build
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/configure-kpn-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  configure-and-launch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Wait for patched kernel fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://raw.githubusercontent.com/dmhfd/android_kernel_common_oneplus_sm8750/oneplus/sm8750_v_15.0.0_oneplus_13/kernel/locking/rtmutex.c'
+          API='https://raw.githubusercontent.com/dmhfd/android_kernel_common_oneplus_sm8750/oneplus/sm8750_v_15.0.0_oneplus_13/kernel/locking/rtmutex_api.c'
+          for i in $(seq 1 60); do
+            if curl -fsSL "$URL" | grep -q 'struct task_struct \*waiter_task = waiter->task;' && \
+               curl -fsSL "$API" | grep -q 'if (unlikely(ret < 0))'; then
+              echo 'Security backport is present in kernel fork.'
+              exit 0
+            fi
+            echo "Kernel fork not patched yet (attempt $i/60)."
+            sleep 5
+          done
+          echo 'Timed out waiting for security backport.' >&2
+          exit 1
+
+      - name: Reconfigure 6.6.30 workflow for own fork and KPN-only mode
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/fastbuild_6.6.30.yml')
+          s = p.read_text()
+
+          old_url = 'https://github.com/cctv18/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_v_15.0.0_oneplus_13.zip'
+          new_url = 'https://github.com/dmhfd/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_v_15.0.0_oneplus_13.zip'
+          if old_url in s:
+              s = s.replace(old_url, new_url)
+
+          expr_ksu = '$' + '{{ github.event.inputs.ksu_type }}'
+          needle = '          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig\n'
+          replacement = (
+              f'          if [[ "{expr_ksu}" == "none" ]]; then\n'
+              '            echo "CONFIG_KSU=n" >> ./common/arch/arm64/configs/gki_defconfig\n'
+              '          else\n'
+              '            echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig\n'
+              '          fi\n'
+          )
+          if needle in s:
+              s = s.replace(needle, replacement, 1)
+          elif 'echo "CONFIG_KSU=n"' not in s:
+              raise SystemExit('Could not find CONFIG_KSU=y insertion point')
+
+          p.write_text(s)
+          PY
+
+          grep -F 'dmhfd/android_kernel_common_oneplus_sm8750/archive' .github/workflows/fastbuild_6.6.30.yml
+          grep -F 'echo "CONFIG_KSU=n"' .github/workflows/fastbuild_6.6.30.yml
+
+      - name: Commit workflow changes to this fork
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! git diff --quiet -- .github/workflows/fastbuild_6.6.30.yml; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add .github/workflows/fastbuild_6.6.30.yml
+            git commit -m 'build: use patched fork and disable KSU in KPN-only builds'
+            git push origin HEAD:main
+          fi
+
+      - name: Launch KPatch-Next-only build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh workflow run fastbuild_6.6.30.yml --ref main \
+            -f ksu_type=none \
+            -f susfs_enable=false \
+            -f kpm_enable=true \
+            -f lz4_enable=false \
+            -f lz4kd_enable=false \
+            -f bbr_enable=false \
+            -f droidspaces_enable=false \
+            -f better_net=false \
+            -f adios_enable=false \
+            -f rekernel_enable=false \
+            -f baseband_guard=false \
+            -f ccache_update=false \
+            -f ccache_debug=false \
+            -f kernel_suffix='fengchi-cve-2026-43499-kpn'
