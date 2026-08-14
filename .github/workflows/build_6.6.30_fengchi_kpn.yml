@@ -1,0 +1,130 @@
+name: 6.6.30 Fengchi KPatch-Next only
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build_6.6.30_fengchi_kpn.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends aria2 unzip zip ccache binutils python-is-python3 libssl-dev libelf-dev dwarves
+
+      - name: Download patched 6.6.30 kernel and LLVM toolchain
+        run: |
+          set -euxo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+
+          aria2c -s16 -x16 -k1M \
+            'https://github.com/dmhfd/android_kernel_common_oneplus_sm8750/archive/refs/heads/oneplus/sm8750_v_15.0.0_oneplus_13.zip' \
+            -o common.zip
+          unzip -q common.zip
+          mv android_kernel_common_oneplus_sm8750-oneplus-sm8750_v_15.0.0_oneplus_13 common
+          rm common.zip
+
+          mkdir -p clang18
+          aria2c -s16 -x16 -k1M \
+            'https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip' \
+            -o clang.zip
+          unzip -q clang.zip -d clang18
+          rm clang.zip
+
+          aria2c -s16 -x16 -k1M \
+            'https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip' \
+            -o build-tools.zip
+          unzip -q build-tools.zip
+          rm build-tools.zip
+
+      - name: Verify security fix and configure Fengchi without KernelSU
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace/common
+
+          grep -q 'struct task_struct \*waiter_task = waiter->task;' kernel/locking/rtmutex.c
+          grep -q 'if (unlikely(ret < 0))' kernel/locking/rtmutex_api.c
+          grep -q '^CONFIG_HMBIRD_SCHED=y$' arch/arm64/configs/gki_defconfig
+
+          # Explicitly keep this build KernelSU-free. KPatch-Next patches Image later.
+          sed -i '/^CONFIG_KSU=/d' arch/arm64/configs/gki_defconfig
+          echo 'CONFIG_KSU=n' >> arch/arm64/configs/gki_defconfig
+          echo 'CONFIG_LOCALVERSION_AUTO=n' >> arch/arm64/configs/gki_defconfig
+          sed -i 's/CONFIG_LOCALVERSION="-4k"/CONFIG_LOCALVERSION="-fengchi-cve-2026-43499-kpn"/' arch/arm64/configs/gki_defconfig
+
+          rm -f android/abi_gki_protected_exports_* || true
+          sed -i 's/check_defconfig//' build.config.gki
+
+      - name: Build 6.6.30 Image
+        run: |
+          set -euxo pipefail
+          WORKDIR="$GITHUB_WORKSPACE"
+          export PATH="/usr/lib/ccache:$WORKDIR/kernel_workspace/clang18/bin:$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export CCACHE_DIR="$HOME/.ccache_6.6.30_kpn"
+          export CCACHE_COMPILERCHECK=none
+          export CCACHE_BASEDIR="$GITHUB_WORKSPACE"
+          export CCACHE_NOHASHDIR=true
+          mkdir -p "$CCACHE_DIR"
+          ccache -M 3G
+
+          cd kernel_workspace/common
+          make -j"$(nproc --all)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC='ccache clang' LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
+
+          grep -q '^CONFIG_HMBIRD_SCHED=y$' out/.config
+          if grep -q '^CONFIG_KSU=y$' out/.config; then
+            echo 'ERROR: CONFIG_KSU unexpectedly enabled' >&2
+            exit 1
+          fi
+
+          make -j"$(nproc --all)" LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC='ccache clang' LD=ld.lld HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
+
+          test -s out/arch/arm64/boot/Image
+          file out/arch/arm64/boot/Image
+          ccache -s
+
+      - name: Patch Image with KPatch-Next
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace/common/out/arch/arm64/boot
+          wget -q 'https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kptools-linux'
+          wget -q 'https://github.com/KernelSU-Next/KPatch-Next/releases/latest/download/kpimg-linux'
+          chmod +x kptools-linux
+          ./kptools-linux -p -i Image -k kpimg-linux -o Image.kpn
+          test -s Image.kpn
+          mv Image.kpn Image
+
+      - name: Package AnyKernel3
+        run: |
+          set -euxo pipefail
+          cd kernel_workspace
+          git clone --depth=1 https://github.com/cctv18/AnyKernel3.git
+          rm -rf AnyKernel3/.git
+          cp common/out/arch/arm64/boot/Image AnyKernel3/Image
+          cd AnyKernel3
+          printf '%s\n' \
+            'Kernel: Linux 6.6.30' \
+            'Scheduler: OPlus HMBIRD/Fengchi' \
+            'Security: CVE-2026-43499 rtmutex backport' \
+            'Root framework: none (CONFIG_KSU=n)' \
+            'Image patch: KPatch-Next' > build-info.txt
+          zip -r ../AnyKernel3_6.6.30_fengchi_CVE-2026-43499_KPatch-Next.zip .
+
+      - name: Upload kernel package
+        uses: actions/upload-artifact@v7
+        with:
+          name: AnyKernel3_6.6.30_fengchi_CVE-2026-43499_KPatch-Next
+          path: kernel_workspace/AnyKernel3_6.6.30_fengchi_CVE-2026-43499_KPatch-Next.zip
+          archive: false
